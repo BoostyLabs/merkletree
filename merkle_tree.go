@@ -6,9 +6,11 @@ package merkletree
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
+	"sort"
 )
 
 //Content represents the data that is stored and verified by the tree. A type that
@@ -25,6 +27,9 @@ type MerkleTree struct {
 	merkleRoot   []byte
 	Leafs        []*Node
 	hashStrategy func() hash.Hash
+	isDup        bool
+	isSortChash  bool
+	isHashOne    bool
 }
 
 //Node represents a node, root, or leaf in the tree. It stores pointers to its immediate
@@ -46,16 +51,30 @@ func (n *Node) verifyNode() ([]byte, error) {
 	if n.leaf {
 		return n.C.CalculateHash()
 	}
-	rightBytes, err := n.Right.verifyNode()
-	if err != nil {
-		return nil, err
-	}
 
 	leftBytes, err := n.Left.verifyNode()
 	if err != nil {
 		return nil, err
 	}
 
+	if n.Right == nil {
+		return leftBytes, nil
+	}
+	rightBytes, err := n.Right.verifyNode()
+	if err != nil {
+		return nil, err
+	}
+
+	if n.Tree.isSortChash {
+		leftHex := hex.EncodeToString(leftBytes)
+		rightHex := hex.EncodeToString(rightBytes)
+		hashes := []string{leftHex, rightHex}
+		sort.Strings(hashes)
+
+		if hashes[0] == rightHex {
+			leftBytes, rightBytes = rightBytes, leftBytes
+		}
+	}
 	h := n.Tree.hashStrategy()
 	if _, err := h.Write(append(leftBytes, rightBytes...)); err != nil {
 		return nil, err
@@ -71,6 +90,9 @@ func (n *Node) calculateNodeHash() ([]byte, error) {
 	}
 
 	h := n.Tree.hashStrategy()
+	if n.Right == nil {
+		return n.Left.Hash, nil
+	}
 	if _, err := h.Write(append(n.Left.Hash, n.Right.Hash...)); err != nil {
 		return nil, err
 	}
@@ -83,6 +105,9 @@ func NewTree(cs []Content) (*MerkleTree, error) {
 	var defaultHashStrategy = sha256.New
 	t := &MerkleTree{
 		hashStrategy: defaultHashStrategy,
+		isDup:        true,
+		isSortChash:  false,
+		isHashOne:    true,
 	}
 	root, leafs, err := buildWithContent(cs, t)
 	if err != nil {
@@ -94,12 +119,15 @@ func NewTree(cs []Content) (*MerkleTree, error) {
 	return t, nil
 }
 
-//NewTreeWithHashStrategy creates a new Merkle Tree using the content cs using the provided hash
-//strategy. Note that the hash type used in the type that implements the Content interface must
+//NewTreeWithParameters creates a new Merkle Tree using the content cs using parametes.
+//Note that the hash type used in the type that implements the Content interface must
 //match the hash type profided to the tree.
-func NewTreeWithHashStrategy(cs []Content, hashStrategy func() hash.Hash) (*MerkleTree, error) {
+func NewTreeWithParameters(cs []Content, hashStrategy func() hash.Hash, isDup bool, isSortChash bool, isHashOne bool) (*MerkleTree, error) {
 	t := &MerkleTree{
 		hashStrategy: hashStrategy,
+		isDup:        isDup,
+		isSortChash:  isSortChash,
+		isHashOne:    isHashOne,
 	}
 	root, leafs, err := buildWithContent(cs, t)
 	if err != nil {
@@ -125,8 +153,10 @@ func (m *MerkleTree) GetMerklePath(content Content) ([][]byte, []int64, error) {
 			var index []int64
 			for currentParent != nil {
 				if bytes.Equal(currentParent.Left.Hash, current.Hash) {
-					merklePath = append(merklePath, currentParent.Right.Hash)
-					index = append(index, 1) // right leaf
+					if currentParent.Right != nil {
+						merklePath = append(merklePath, currentParent.Right.Hash)
+						index = append(index, 1) // right leaf
+					}
 				} else {
 					merklePath = append(merklePath, currentParent.Left.Hash)
 					index = append(index, 0) // left leaf
@@ -161,16 +191,19 @@ func buildWithContent(cs []Content, t *MerkleTree) (*Node, []*Node, error) {
 			Tree: t,
 		})
 	}
-	if len(leafs)%2 == 1 {
-		duplicate := &Node{
-			Hash: leafs[len(leafs)-1].Hash,
-			C:    leafs[len(leafs)-1].C,
-			leaf: true,
-			dup:  true,
-			Tree: t,
+	if t.isDup {
+		if len(leafs)%2 == 1 {
+			duplicate := &Node{
+				Hash: leafs[len(leafs)-1].Hash,
+				C:    leafs[len(leafs)-1].C,
+				leaf: true,
+				dup:  true,
+				Tree: t,
+			}
+			leafs = append(leafs, duplicate)
 		}
-		leafs = append(leafs, duplicate)
 	}
+
 	root, err := buildIntermediate(leafs, t)
 	if err != nil {
 		return nil, nil, err
@@ -187,8 +220,33 @@ func buildIntermediate(nl []*Node, t *MerkleTree) (*Node, error) {
 		h := t.hashStrategy()
 		var left, right int = i, i + 1
 		if i+1 == len(nl) {
-			right = i
+			if t.isHashOne {
+				right = i
+			} else {
+				n := &Node{
+					Left:  nl[left],
+					Right: nil,
+					Hash:  nl[left].Hash,
+					Tree:  t,
+				}
+
+				nodes = append(nodes, n)
+				nl[left].Parent = n
+				break
+			}
 		}
+
+		if t.isSortChash {
+			leftHex := hex.EncodeToString(nl[left].Hash)
+			rightHex := hex.EncodeToString(nl[right].Hash)
+			hashes := []string{leftHex, rightHex}
+			sort.Strings(hashes)
+
+			if hashes[0] == rightHex {
+				nl[left], nl[right] = nl[right], nl[left]
+			}
+		}
+
 		chash := append(nl[left].Hash, nl[right].Hash...)
 		if _, err := h.Write(chash); err != nil {
 			return nil, err
@@ -249,11 +307,12 @@ func (m *MerkleTree) RebuildTreeWith(cs []Content) error {
 //resulting hash at the root of the tree matches the resulting root hash; returns false otherwise.
 func (m *MerkleTree) VerifyTree() (bool, error) {
 	calculatedMerkleRoot, err := m.Root.verifyNode()
+
 	if err != nil {
 		return false, err
 	}
 
-	if bytes.Compare(m.merkleRoot, calculatedMerkleRoot) == 0 {
+	if res := bytes.Compare(m.merkleRoot, calculatedMerkleRoot); res == 0 {
 		return true, nil
 	}
 	return false, nil
@@ -286,7 +345,7 @@ func (m *MerkleTree) VerifyContent(content Content) (bool, error) {
 				if _, err := h.Write(append(leftBytes, rightBytes...)); err != nil {
 					return false, err
 				}
-				if bytes.Compare(h.Sum(nil), currentParent.Hash) != 0 {
+				if res := bytes.Compare(h.Sum(nil), currentParent.Hash); res != 0 {
 					return false, nil
 				}
 				currentParent = currentParent.Parent
